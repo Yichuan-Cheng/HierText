@@ -10,14 +10,14 @@ from PIL import ImageOps
 import matplotlib.pyplot as plt
 from shapely.geometry import Polygon
 
-# from .aug_strategy import imgaug_mask
-# from .aug_strategy import pipe_sequential_rotate
-# from .aug_strategy import pipe_sequential_translate
-# from .aug_strategy import pipe_sequential_scale
-# from .aug_strategy import pipe_someof_flip
-# from .aug_strategy import pipe_someof_blur
-# from .aug_strategy import pipe_sometimes_mpshear
-# from .aug_strategy import pipe_someone_contrast
+from aug_strategy import imgaug_mask
+from aug_strategy import pipe_sequential_rotate
+from aug_strategy import pipe_sequential_translate
+from aug_strategy import pipe_sequential_scale
+from aug_strategy import pipe_someof_flip
+from aug_strategy import pipe_someof_blur
+from aug_strategy import pipe_sometimes_mpshear
+from aug_strategy import pipe_someone_contrast
 def visualize(text_dict, level='word'):
     h, w, n_mask = text_dict['gt_masks'].shape
     if not n_mask:
@@ -48,7 +48,7 @@ def imresize(im, size, interp='bilinear'):
     return im.resize(size, resample)
         
 class BaseDataset(torch.utils.data.Dataset):
-    def __init__(self, odgt, opt, **kwargs):
+    def __init__(self, opt, **kwargs):
         # parse options        
         self.imgSizes = opt.INPUT.CROP.SIZE
         self.imgMaxSize = opt.INPUT.CROP.MAX_SIZE
@@ -56,9 +56,11 @@ class BaseDataset(torch.utils.data.Dataset):
         self.padding_constant = 2**5 # resnet 总共下采样5次
 
         # parse the input list
-        self.parse_input_list(odgt, **kwargs)
-        self.pixel_mean = np.array(opt.DATASETS.PIXEL_MEAN)
-        self.pixel_std = np.array(opt.DATASETS.PIXEL_STD)
+        # self.parse_input_list(odgt, **kwargs)
+        # self.pixel_mean = np.array(opt.DATASETS.PIXEL_MEAN)
+        # self.pixel_std = np.array(opt.DATASETS.PIXEL_STD)
+        self.pixel_mean = 0
+        self.pixel_std = 1
 
     def parse_input_list(self, odgt, max_sample=-1, start_idx=-1, end_idx=-1):
         if isinstance(odgt, list):
@@ -139,114 +141,9 @@ class BaseDataset(torch.utils.data.Dataset):
         return False
     
 
-class ADE200kDataset(BaseDataset):
-    def __init__(self, odgt, opt, dynamic_batchHW=False, **kwargs):
-        super(ADE200kDataset, self).__init__(odgt, opt, **kwargs)
-        self.root_dataset = opt.DATASETS.ROOT_DIR
-        # down sampling rate of segm labe
-        self.segm_downsampling_rate = opt.MODEL.SEM_SEG_HEAD.COMMON_STRIDE # 网络输出相对于输入缩小的倍数
-        self.dynamic_batchHW = dynamic_batchHW  # 是否动态调整batchHW, cswin_transformer需要使用固定image size
-        self.num_querys = opt.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
-        # self.visualize = ADEVisualize()
-
-        self.aug_pipe = self.get_data_aug_pipe()
-
-    def get_data_aug_pipe(self):
-        pipe_aug = []
-        if random.random() > 0.5:
-            aug_list = [pipe_sequential_rotate, pipe_sequential_scale, pipe_sequential_translate, pipe_someof_blur,
-                        pipe_someof_flip, pipe_sometimes_mpshear, pipe_someone_contrast]
-            index = np.random.choice(a=[0, 1, 2, 3, 4, 5, 6],
-                                    p=[0.05, 0.25, 0.20, 0.25, 0.15, 0.05, 0.05])
-            if (index == 0 or index == 4 or index == 5) and random.random() < 0.5:  # 会稍微削弱旋转 但是会极大增强其他泛化能力
-                index2 = np.random.choice(a=[1, 2, 3], p=[0.4, 0.3, 0.3])
-                pipe_aug = [aug_list[index], aug_list[index2]]
-            else:
-                pipe_aug = [aug_list[index]]
-        return pipe_aug
-
-    def get_batch_size(self, batch_records):
-        batch_width, batch_height = self.imgMaxSize, self.imgMaxSize
-
-        if self.dynamic_batchHW:            
-            if isinstance(self.imgSizes, list) or isinstance(self.imgSizes, tuple):
-                this_short_size = np.random.choice(self.imgSizes)
-            else:
-                this_short_size = self.imgSizes
-
-            batch_widths = np.zeros(len(batch_records), np.int32)
-            batch_heights = np.zeros(len(batch_records), np.int32)
-            for i, item in enumerate(batch_records):
-                img_height, img_width = item['image'].shape[0], item['image'].shape[1]
-                this_scale = min(
-                    this_short_size / min(img_height, img_width), \
-                    self.imgMaxSize / max(img_height, img_width))
-                batch_widths[i] = img_width * this_scale
-                batch_heights[i] = img_height * this_scale
-            
-            batch_width = np.max(batch_widths)
-            batch_height = np.max(batch_heights)
-            
-        batch_width = int(self.round2nearest_multiple(batch_width, self.padding_constant))
-        batch_height = int(self.round2nearest_multiple(batch_height, self.padding_constant))
-
-        return batch_width, batch_height
-
-    def __getitem__(self, index):        
-        this_record = self.list_sample[index]
-        # load image and label
-        image_path = os.path.join(self.root_dataset, this_record['fpath_img'])
-        segm_path = os.path.join(self.root_dataset, this_record['fpath_segm'])
-        
-        img = Image.open(image_path).convert('RGB')
-        segm = Image.open(segm_path).convert('L')
-
-        # data augmentation            
-        img = np.array(img)
-        segm = np.array(segm)
-        for seq in self.aug_pipe:
-            img, segm = imgaug_mask(img, segm, seq)
-
-        output = dict()
-        output['image'] = img
-        output['mask'] = segm
-
-        return output
-
-
-    # Customization of batchify process, mainly for dynamic scale training
-    def collate_fn(self, batch):
-        batch_width, batch_height = self.get_batch_size(batch)
-        out = {}
-        images = []
-        masks = []
-
-        for item in batch:
-            img = item['image']
-            segm = item['mask']
-
-            img = Image.fromarray(img)
-            segm = Image.fromarray(segm)
-
-            img = self.resize_padding(img, (batch_width, batch_height))
-            img = self.img_transform(img)
-            segm = self.resize_padding(segm, (batch_width, batch_height), Image.NEAREST)
-            segm = segm.resize((batch_width // self.segm_downsampling_rate, batch_height // self.segm_downsampling_rate), Image.NEAREST)
-
-            images.append(torch.from_numpy(img).float())
-            masks.append(torch.from_numpy(np.array(segm)).long())
-
-        out['images'] = torch.stack(images)
-        out['masks'] = torch.stack(masks)
-        return out        
-
-    def __len__(self):
-        return self.num_sample
-
-
 class HierTextDataset(BaseDataset):
     def __init__(self, opt, dynamic_batchHW = False, is_training = True, **kwargs):
-        super(HierTextDataset, self).__init__('training.odgt', opt, **kwargs)
+        super(HierTextDataset, self).__init__( opt, **kwargs)
         
         if is_training:
             SUBSET = 'train'
@@ -256,13 +153,13 @@ class HierTextDataset(BaseDataset):
         self.IMAGE_SUBSET_DIR_PATH = os.path.join(opt.DATASETS.IMAGE_DIR_PATH, SUBSET)
         ANN_PATH = os.path.join(opt.DATASETS.ANN_DIR_PATH, f'{SUBSET}.jsonl')
         self.training = is_training
-        self.annotations = json.load(open(ANN_PATH, 'r'))['annotations']
+        self.annotations = json.load(open(ANN_PATH, 'r', encoding='utf-8'))['annotations']
         self.detect_level = 'line'
         # self.img_list =  [ann['image_id'] for ann in self.annotations]
         # down sampling rate of segm labe
-        self.segm_downsampling_rate = opt.MODEL.SEM_SEG_HEAD.COMMON_STRIDE # 网络输出相对于输入缩小的倍数
+        # self.segm_downsampling_rate = opt.MODEL.SEM_SEG_HEAD.COMMON_STRIDE # 网络输出相对于输入缩小的倍数
         self.dynamic_batchHW = dynamic_batchHW  # 是否动态调整batchHW, cswin_transformer需要使用固定image size
-        self.max_num_instances = opt.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES - 1
+        self.max_num_instances = opt.MODEL.NUM_OBJECT_QUERIES - 1
         # self.visualize = ADEVisualize()
 
         # self.aug_pipe = self.get_data_aug_pipe()
@@ -419,7 +316,7 @@ class HierTextDataset(BaseDataset):
                 gt_line_mask = np.zeros((h, w), dtype=np.float32)
                 for word in line['words']:
                     word_idx += 1
-                    if not not_croped[word_idx] and self.training:
+                    if self.training and not not_croped[word_idx]:
                         continue
                     gt_word_weights.append(1.0 if word['legible'] else 0.0)
                     gt_word_texts.append(word['text'])

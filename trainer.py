@@ -19,7 +19,7 @@ from summary import create_summary
 # from utils.solver import maybe_add_gradient_clipping
 from misc import load_parallal_model
 
-class Hier_trainer():
+class trainer():
     def __init__(self, im_size=128,n_classes=1,pretrained_path=None,save_dir='output/save/',local_rank=0, ngpus=1,lr=0.001,log_dir='output/log/'):
         super().__init__()
         self.model=UnifiedDetector(im_size=im_size,n_classes=n_classes)
@@ -193,8 +193,3 @@ class Hier_trainer():
         PQ1=IoU_sum1/(TP_cnt1+0.5*FP_cnt1+0.5*FN_cnt1)
         PQ2=IoU_sum2/(TP_cnt2+0.5*FP_cnt2+0.5*FN_cnt2)
         return (PQ1+PQ2)/2
-
-
-
-
-

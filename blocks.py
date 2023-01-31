@@ -356,11 +356,11 @@ class DualPathXF(nn.Module):
         P_out = self.relu(P_out)
 
         M_out = self.mem_fc2(rearrange(ymb, 'n b i j -> n b (i j)'))
-        M_out = M_identity + M_out                  # M_out += M_identity
+        M_out += M_identity
         M_out = self.relu(M_out)
 
         M_ffn = self.mem_ffn(M_out)
-        M_out = M_ffn + M_out
+        M_out += M_ffn
         M_out = self.relu(M_out)
 
         return {'pixel': P_out, 'memory': M_out}
