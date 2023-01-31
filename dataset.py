@@ -4,20 +4,23 @@ import torch
 
 import numpy as np
 import random
+import math
 import cv2
+import torch.nn as nn
 from PIL import Image
 from PIL import ImageOps
 import matplotlib.pyplot as plt
 from shapely.geometry import Polygon
+import torchvision.transforms as transform
 
-from aug_strategy import imgaug_mask
-from aug_strategy import pipe_sequential_rotate
-from aug_strategy import pipe_sequential_translate
-from aug_strategy import pipe_sequential_scale
-from aug_strategy import pipe_someof_flip
-from aug_strategy import pipe_someof_blur
-from aug_strategy import pipe_sometimes_mpshear
-from aug_strategy import pipe_someone_contrast
+# from .aug_strategy import imgaug_mask
+# from .aug_strategy import pipe_sequential_rotate
+# from .aug_strategy import pipe_sequential_translate
+# from .aug_strategy import pipe_sequential_scale
+# from .aug_strategy import pipe_someof_flip
+# from .aug_strategy import pipe_someof_blur
+# from .aug_strategy import pipe_sometimes_mpshear
+# from .aug_strategy import pipe_someone_contrast
 def visualize(text_dict, level='word'):
     h, w, n_mask = text_dict['gt_masks'].shape
     if not n_mask:
@@ -51,16 +54,14 @@ class BaseDataset(torch.utils.data.Dataset):
     def __init__(self, opt, **kwargs):
         # parse options        
         self.imgSizes = opt.INPUT.CROP.SIZE
-        self.imgMaxSize = opt.INPUT.CROP.MAX_SIZE
+        self.imgMaxSize = 1024
         # max down sampling rate of network to avoid rounding during conv or pooling
         self.padding_constant = 2**5 # resnet 总共下采样5次
 
         # parse the input list
         # self.parse_input_list(odgt, **kwargs)
-        # self.pixel_mean = np.array(opt.DATASETS.PIXEL_MEAN)
-        # self.pixel_std = np.array(opt.DATASETS.PIXEL_STD)
-        self.pixel_mean = 0
-        self.pixel_std = 1
+        self.pixel_mean = np.array(opt.DATASETS.PIXEL_MEAN)
+        self.pixel_std = np.array(opt.DATASETS.PIXEL_STD)
 
     def parse_input_list(self, odgt, max_sample=-1, start_idx=-1, end_idx=-1):
         if isinstance(odgt, list):
@@ -79,9 +80,10 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def img_transform(self, img):
         # 0-255 to 0-1
-        img = np.float32(np.array(img)) / 255.   
-        img = (img - self.pixel_mean) / self.pixel_std
-        img = img.transpose((2, 0, 1))
+        # print(img.shape)
+        img = img / 255.   
+        img = (img - torch.from_numpy(self.pixel_mean).unsqueeze(1).unsqueeze(2)) / torch.from_numpy(self.pixel_std).unsqueeze(1).unsqueeze(2)
+        # img = img.transpose((2, 0, 1))
         return img
 
     def segm_transform(self, segm):
@@ -91,7 +93,8 @@ class BaseDataset(torch.utils.data.Dataset):
 
     # Round x to the nearest multiple of p and x' >= x
     def round2nearest_multiple(self, x, p):
-        return ((x - 1) // p + 1) * p
+        return ((x - 1) // p + 1) * p         
+
     
     def get_img_ratio(self, img_size, target_size):
         img_rate = np.max(img_size) / np.min(img_size)
@@ -104,7 +107,7 @@ class BaseDataset(torch.utils.data.Dataset):
         return ratio
 
     def resize_padding(self, img, outsize, Interpolation=Image.BILINEAR):
-        w, h = img.shape
+        w, h = img.size
         target_w, target_h = outsize[0], outsize[1]
         ratio = self.get_img_ratio([w, h], outsize)
         ow, oh = round(w * ratio), round(h * ratio)
@@ -114,6 +117,25 @@ class BaseDataset(torch.utils.data.Dataset):
         left, right = dw // 2, dw - (dw // 2)
         img = ImageOps.expand(img, border=(left, top, right, bottom), fill=0)  # 左 顶 右 底 顺时针
         return img
+
+    def padding_torch(self, img, outsize, Interpolation=transform.InterpolationMode.NEAREST):
+        c, h, w = img.shape
+        target_w, target_h = outsize[0], outsize[1]
+        ratio = self.get_img_ratio([w, h], outsize)
+        ow, oh = round(w * ratio), round(h * ratio)
+        resize = transform.Resize((oh, ow), interpolation=Interpolation)
+        img = resize(img)
+        # print(target_h, target_w, img.shape)
+        dh, dw = target_h - oh, target_w - ow
+        top, bottom = dh // 2, dh - (dh // 2)
+        left, right = dw // 2, dw - (dw // 2)
+        zeroPad = nn.ZeroPad2d((left, right, top, bottom))
+
+        img = zeroPad(img)
+        # print(img.shape)
+
+        return img
+
     
     def is_cross_text(self, start_loc, length, vertices):
         '''check if the crop image crosses text regions
@@ -141,9 +163,10 @@ class BaseDataset(torch.utils.data.Dataset):
         return False
     
 
+
 class HierTextDataset(BaseDataset):
     def __init__(self, opt, dynamic_batchHW = False, is_training = True, **kwargs):
-        super(HierTextDataset, self).__init__( opt, **kwargs)
+        super(HierTextDataset, self).__init__(opt, **kwargs)
         
         if is_training:
             SUBSET = 'train'
@@ -153,35 +176,22 @@ class HierTextDataset(BaseDataset):
         self.IMAGE_SUBSET_DIR_PATH = os.path.join(opt.DATASETS.IMAGE_DIR_PATH, SUBSET)
         ANN_PATH = os.path.join(opt.DATASETS.ANN_DIR_PATH, f'{SUBSET}.jsonl')
         self.training = is_training
-        self.annotations = json.load(open(ANN_PATH, 'r', encoding='utf-8'))['annotations']
+        self.annotations = json.load(open(ANN_PATH, 'r'))['annotations']
         self.detect_level = 'line'
         # self.img_list =  [ann['image_id'] for ann in self.annotations]
         # down sampling rate of segm labe
-        # self.segm_downsampling_rate = opt.MODEL.SEM_SEG_HEAD.COMMON_STRIDE # 网络输出相对于输入缩小的倍数
+        self.segm_downsampling_rate = opt.MODEL.SEM_SEG_HEAD.COMMON_STRIDE # 网络输出相对于输入缩小的倍数
         self.dynamic_batchHW = dynamic_batchHW  # 是否动态调整batchHW, cswin_transformer需要使用固定image size
-        self.max_num_instances = opt.MODEL.NUM_OBJECT_QUERIES - 1
+        self.max_num_instances = opt.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES - 1
         # self.visualize = ADEVisualize()
 
         # self.aug_pipe = self.get_data_aug_pipe()
 
-    def get_data_aug_pipe(self):
-        pipe_aug = []
-        if random.random() > 0.5:
-            aug_list = [pipe_sequential_rotate, pipe_sequential_scale, pipe_sequential_translate, pipe_someof_blur,
-                        pipe_someof_flip, pipe_sometimes_mpshear, pipe_someone_contrast]
-            index = np.random.choice(a=[0, 1, 2, 3, 4, 5, 6],
-                                    p=[0.05, 0.25, 0.20, 0.25, 0.15, 0.05, 0.05])
-            if (index == 0 or index == 4 or index == 5) and random.random() < 0.5:  # 会稍微削弱旋转 但是会极大增强其他泛化能力
-                index2 = np.random.choice(a=[1, 2, 3], p=[0.4, 0.3, 0.3])
-                pipe_aug = [aug_list[index], aug_list[index2]]
-            else:
-                pipe_aug = [aug_list[index]]
-        return pipe_aug
 
-    def get_batch_size(self, batch_records):
+    def get_batch_size(self, batch_records, dynamic_HW = False):
         batch_width, batch_height = self.imgMaxSize, self.imgMaxSize
 
-        if self.dynamic_batchHW:            
+        if dynamic_HW:            
             if isinstance(self.imgSizes, list) or isinstance(self.imgSizes, tuple):
                 this_short_size = np.random.choice(self.imgSizes)
             else:
@@ -287,6 +297,7 @@ class HierTextDataset(BaseDataset):
         gt_paragraph_masks = []
         gt_paragraph_weights = []
         # dont_care_masks = []
+        not_croped = [1] * 1000
 
         if self.training:
             all_vertices=[]
@@ -299,7 +310,9 @@ class HierTextDataset(BaseDataset):
             image, crop_info, vertices = self.random_crop(image, all_vertices, length=1024)
             not_croped = []
             for v in vertices:
-                not_croped.append(Polygon(v).convex_hull.area > 20)
+                not_croped.append(Polygon(v).convex_hull.area > 10)
+        else:
+            crop_info = (1,1,0,0)
             # print(not_croped)
             # print(crop_box)
             # print(np.array(image).shape)
@@ -316,12 +329,16 @@ class HierTextDataset(BaseDataset):
                 gt_line_mask = np.zeros((h, w), dtype=np.float32)
                 for word in line['words']:
                     word_idx += 1
-                    if self.training and not not_croped[word_idx]:
+                    if not not_croped[word_idx] and self.training:
                         continue
                     gt_word_weights.append(1.0 if word['legible'] else 0.0)
                     gt_word_texts.append(word['text'])
-                    # vertices = np.array(word['vertices'])
-                    new_vertices = vertices[word_idx]
+
+                    if self.training:
+                        new_vertices = vertices[word_idx]
+                    else:
+                        new_vertices = np.array(word['vertices'])
+                    
                     gt_word_para_ids.append(para_id)
                     gt_word_mask = self.draw_mask(new_vertices, w, h)
                     gt_word_masks.append(gt_word_mask)
@@ -465,7 +482,7 @@ class HierTextDataset(BaseDataset):
         labels['image'] = image
         labels['segmentation_mask'] = segmentation_mask
         labels['instance_masks'] = kept_instance_and_bkg_masks
-        labels['instance_classes'] = instance_and_bkg_classes               #[2,1,1,1,1,..,1,0,0,...,0] 2 for bkg, 1 for words/lines , 0 for none-obj
+        labels['instance_classes'] = instance_and_bkg_classes                       #[2,1,1,1,1,..,1,0,0,...,0] 2 for bkg, 1 for words/lines , 0 for none-obj
 
         labels['layout_labels'] = para_ids
 
@@ -490,24 +507,35 @@ class HierTextDataset(BaseDataset):
         if not self.training:
             batch_width, batch_height = self.get_batch_size(batch)
             for item in batch:
-                img = item['image']
-                img = Image.fromarray(img)
-                img = self.resize_padding(img, (batch_width, batch_height))
-                img = self.img_transform(img)                                                           # Normalize
 
-                images.append(torch.from_numpy(img).float())
+                img = self.padding_torch(torch.from_numpy(item['image']).permute(2,0,1), (batch_width, batch_height),transform.InterpolationMode.BILINEAR)
+                img = self.img_transform(img)                                                           # Normalize
+                segm = self.padding_torch(item['segmentation_mask'].unsqueeze(0), (batch_width, batch_height))
+                insm = self.padding_torch(item['instance_masks'], (batch_width, batch_height))
+
+                images.append(img)
+                seg_masks.append(segm[:,0])
+                ins_masks.append(insm)
+                ins_classes.append(item['instance_classes'].long())
+                layout_labels.append(item['layout_labels'].long())
+                num_instances.append(item['num_instances'])
             
             out['images'] = torch.stack(images)
+            out['segmentation_masks'] = torch.stack(seg_masks)
+            out['instance_masks'] = torch.stack(ins_masks)
+            out['instance_classes'] = torch.stack(ins_classes)
+            out['layout_labels'] = torch.stack(layout_labels)
+            out['num_instances'] = num_instances
  
         else:
             for item in batch:
                 if item['num_instances'] == 0:
                     continue                            # ignore images without test instances
                 
-                img = Image.fromarray(np.uint8(item['image']))
-                img = self.img_transform(img)
+                # img = Image.fromarray(np.uint8(item['image']))
+                img = self.img_transform(torch.from_numpy(item['image']).permute(2,0,1))
 
-                images.append(torch.from_numpy(img).float())
+                images.append(img)
                 seg_masks.append(item['segmentation_mask'])
                 ins_masks.append(item['instance_masks'])
                 ins_classes.append(item['instance_classes'].long())
@@ -515,10 +543,10 @@ class HierTextDataset(BaseDataset):
                 num_instances.append(item['num_instances'])
             
             dynamic_HW = np.random.choice([224, 320, 480, 512])
-            from torchvision.transforms import Resize
-            torch_resize = Resize([dynamic_HW, dynamic_HW])
+            # from torchvision.transforms import Resize
+            # torch_resize = Resize([dynamic_HW, dynamic_HW])
 
-            out['images'] = torch_resize(torch.stack(images))
+            out['images'] = torch.stack(images)
             out['segmentation_masks'] = torch.stack(seg_masks)
             out['instance_masks'] = torch.stack(ins_masks)
             out['instance_classes'] = torch.stack(ins_classes)
@@ -717,19 +745,32 @@ if __name__ == '__main__':
         return cfg
 
     cfg = get_args()
-    dataset_train = HierTextDataset(cfg, dynamic_batchHW=True)
+    dataset_train = HierTextDataset(cfg, dynamic_batchHW=True, is_training=True)
     train_sampler = None
     loader_train = torch.utils.data.DataLoader(
         dataset_train,
-        batch_size=8,
+        batch_size=1,
         shuffle=False,  
         collate_fn=dataset_train.collate_fn,
-        num_workers=8,
+        num_workers=1,
         drop_last=True,
         pin_memory=True,
         sampler=train_sampler)
 
+    dataset_val = HierTextDataset(cfg, dynamic_batchHW=True, is_training=False)
+    loader_val = torch.utils.data.DataLoader(
+        dataset_val,
+        batch_size=1,
+        shuffle=False,  
+        collate_fn=dataset_val.collate_fn,
+        num_workers=1,)
+
     for i, batch in enumerate(loader_train):  
         print(batch['images'].shape, batch['instance_masks'].shape, batch['instance_classes'].shape,
             batch['segmentation_masks'].shape, batch['layout_labels'].shape, batch['num_instances'])
-        # break
+        break
+
+    for i, batch in enumerate(loader_val):  
+        print(batch['images'].shape, batch['instance_masks'].shape, batch['instance_classes'].shape,
+            batch['segmentation_masks'].shape, batch['layout_labels'].shape, batch['num_instances'])
+        break
